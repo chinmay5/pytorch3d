@@ -31,6 +31,8 @@
 #include "rasterize_points/rasterize_points.h"
 #include "sample_farthest_points/sample_farthest_points.h"
 #include "sample_pdf/sample_pdf.h"
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("face_areas_normals_forward", &FaceAreasNormalsForward);
@@ -45,7 +47,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("knn_points_idx", &KNearestNeighborIdx);
   m.def("knn_points_backward", &KNearestNeighborBackward);
   m.def("ball_query", &BallQuery);
-  m.def("sample_farthest_points", &FarthestPointSampling);
+  m.def("sample_farthest_points",
+        &FarthestPointSampling,
+        py::arg("points"),
+        py::arg("lengths"),
+        py::arg("K"),
+        py::arg("start_idxs"),
+        py::arg("start_length") = py::none(),      //  ← default = None
+        R"doc(
+Farthest-point sampling with an optional variable-length seed set.
+
+Args:
+    points (Tensor): (N,P,3) point clouds
+    lengths (Tensor): (N,) valid point counts
+    K (Tensor): (N,) number of *new* points to sample
+    start_idxs (Tensor): (N,Q) buffer for seed indices
+    start_length (Tensor | None): (N,) number of valid seeds per cloud
+)doc");
   m.def(
       "mesh_normal_consistency_find_verts", &MeshNormalConsistencyFindVertices);
   m.def("gather_scatter", &GatherScatter);

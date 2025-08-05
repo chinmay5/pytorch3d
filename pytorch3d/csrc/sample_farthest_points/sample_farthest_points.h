@@ -10,6 +10,7 @@
 #include <torch/extension.h>
 #include <tuple>
 #include "utils/pytorch3d_cutils.h"
+#include <c10/util/Optional.h>   // gives you c10::optional
 
 // Iterative farthest point sampling algorithm [1] to subsample a set of
 // K points from a given pointcloud. At each iteration, a point is selected
@@ -51,22 +52,61 @@ at::Tensor FarthestPointSamplingCpu(
     const at::Tensor& K,
     const at::Tensor& start_idxs);
 
-// Exposed implementation.
-at::Tensor FarthestPointSampling(
+at::Tensor FarthestPointSamplingGraphCuda(
     const at::Tensor& points,
     const at::Tensor& lengths,
     const at::Tensor& K,
-    const at::Tensor& start_idxs) {
-  if (points.is_cuda() || lengths.is_cuda() || K.is_cuda()) {
+    const at::Tensor& start_idxs,
+    const at::Tensor& start_length);
+
+at::Tensor FarthestPointSamplingGraphCpu(
+    const at::Tensor& points,
+    const at::Tensor& lengths,
+    const at::Tensor& K,
+    const at::Tensor& start_idxs,
+    const at::Tensor& start_length);  // <-- new parameter
+
+// Exposed implementation.
+at::Tensor FarthestPointSampling(
+    const at::Tensor&                      points,
+    const at::Tensor&                      lengths,
+    const at::Tensor&                      K,
+    const at::Tensor&                      start_idxs,
+    c10::optional<at::Tensor>              start_length = c10::nullopt)
+{
+  /* decide on device path first */
+  const bool use_cuda = points.is_cuda() || lengths.is_cuda() || K.is_cuda();
+
+  /* ── CUDA path ─────────────────────────────────────────────────────────── */
+  if (use_cuda) {
 #ifdef WITH_CUDA
+    /* fast compile-time checks */
     CHECK_CUDA(points);
     CHECK_CUDA(lengths);
     CHECK_CUDA(K);
     CHECK_CUDA(start_idxs);
+
+    if (start_length.has_value()) {
+        /* variable-seed variant */
+        const at::Tensor& start_len = *start_length;   // ← one clean alias
+
+        CHECK_CUDA(start_len);
+        // If you also use CHECK_CONTIGUOUS / shape checks, do it on start_len too.
+
+        return FarthestPointSamplingGraphCuda(
+            points, lengths, K, start_idxs, start_len);
+    }
+    /* classic single-seed variant */
     return FarthestPointSamplingCuda(points, lengths, K, start_idxs);
 #else
     AT_ERROR("Not compiled with GPU support.");
 #endif
+  }
+
+  /* ── CPU path ──────────────────────────────────────────────────────────── */
+  if (start_length.has_value()) {
+    return FarthestPointSamplingGraphCpu(
+        points, lengths, K, start_idxs, *start_length);
   }
   return FarthestPointSamplingCpu(points, lengths, K, start_idxs);
 }

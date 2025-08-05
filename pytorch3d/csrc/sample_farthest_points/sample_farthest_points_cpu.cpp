@@ -8,8 +8,11 @@
 
 #include <torch/extension.h>
 #include <iterator>
+#include <limits>
+#include <algorithm>
 #include <random>
 #include <vector>
+static std::mt19937 rng{std::random_device{}()};
 
 at::Tensor FarthestPointSamplingCpu(
     const at::Tensor& points,
@@ -100,4 +103,104 @@ at::Tensor FarthestPointSamplingCpu(
   }
 
   return sampled_indices;
+}
+
+at::Tensor FarthestPointSamplingGraphCpu(
+    const at::Tensor& points,
+    const at::Tensor& lengths,
+    const at::Tensor& K,
+    const at::Tensor& start_idxs,
+    const at::Tensor& start_length) {
+
+  /* constants */
+  const int64_t N = points.size(0);
+  const int64_t P = points.size(1);
+  const int64_t D = points.size(2);
+
+  /* rectangular width T = seeds + new picks (same for all n) */
+  const at::Tensor tot = K + start_length;               // (N)
+  TORCH_CHECK((tot == tot[0]).all().item<bool>(),
+              "K[n] + start_length[n] must be equal across batch");
+  const int64_t T = tot[0].item<int64_t>();
+
+  /* output tensor (N,T) */
+  auto long_opts = lengths.options();
+  torch::Tensor indices = torch::full({N, T}, -1, long_opts);
+
+  /* accessors */
+  auto pts_a  = points.accessor<float,   3>();
+  auto len_a  = lengths.accessor<int64_t,1>();
+  auto k_a    = K.accessor<int64_t,      1>();
+  auto idx_a  = indices.accessor<int64_t,2>();
+  auto seed_a = start_idxs.accessor<int64_t,2>();
+  auto L_a    = start_length.accessor<int64_t,1>();
+
+  std::vector<unsigned char> selected;   // mask
+  std::vector<float>         dists;      // min-distance cache
+
+  for (int64_t n = 0; n < N; ++n) {
+
+    const int64_t Pn   = len_a[n];
+    const int64_t L    = L_a[n];                         // seeds
+    const int64_t newK = std::min<int64_t>(k_a[n], Pn - L);
+
+    selected.assign(Pn, 0);
+    dists.assign(Pn, std::numeric_limits<float>::max());
+
+    /* ── warm-up with user seeds ─────────────────────────────────────── */
+    for (int64_t j = 0; j < L; ++j) {
+      const int64_t s = seed_a[n][j];
+      idx_a[n][j]      = s;
+      selected[s]      = 1;
+
+      for (int64_t p = 0; p < Pn; ++p) {
+        float dist2 = 0.f;
+        for (int64_t d = 0; d < D; ++d) {
+          float diff = pts_a[n][s][d] - pts_a[n][p][d];
+          dist2 += diff * diff;
+        }
+        dists[p] = std::min(dists[p], dist2);
+      }
+    }
+
+    int64_t last_idx = (L > 0) ? seed_a[n][L - 1] : 0;
+
+    /* ── stochastic FPS loop ─────────────────────────────────────────── */
+    for (int64_t k = 0; k < newK; ++k) {
+
+      /* update distance cache against last pivot */
+      for (int64_t p = 0; p < Pn; ++p) {
+        if (selected[p]) { dists[p] = 0.f; continue; }
+
+        float dist2 = 0.f;
+        for (int64_t d = 0; d < D; ++d) {
+          float diff = pts_a[n][last_idx][d] - pts_a[n][p][d];
+          dist2 += diff * diff;
+        }
+        dists[p] = std::min(dists[p], dist2);
+      }
+
+      /* gather unselected candidates */
+      std::vector<int64_t> cand; cand.reserve(Pn);
+      for (int64_t p = 0; p < Pn; ++p)
+        if (!selected[p]) cand.push_back(p);
+
+      const int64_t topk = std::min<int64_t>(20, cand.size());
+
+      /* partial sort first topk elements by descending distance */
+      std::partial_sort(
+          cand.begin(), cand.begin() + topk, cand.end(),
+          [&](int64_t a, int64_t b) { return dists[a] > dists[b]; });
+
+      /* uniform random pick among the topk farthest */
+      std::uniform_int_distribution<int64_t> uni(0, topk - 1);
+      last_idx = cand[uni(rng)];
+
+      /* record & mark */
+      idx_a[n][L + k]  = last_idx;
+      selected[last_idx] = 1;
+    }
+  }
+
+  return indices;
 }
