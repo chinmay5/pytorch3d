@@ -246,16 +246,28 @@ __global__ void FarthestPointSamplingGraphKernel(
       BlockReduce;
   __shared__ typename BlockReduce::TempStorage temp_storage;
   __shared__ int64_t selected_store;
+  
+  // Shared memory for caching distances and collaborative top-K selection
+  constexpr int SHARED_MEM_SIZE = 512; // Adjust based on available shared memory
+  constexpr int TOP_K = 20;
+  __shared__ float shared_dist_cache[SHARED_MEM_SIZE];
+  __shared__ float top_dist_shared[TOP_K];
+  __shared__ int64_t top_idx_shared[TOP_K];
 
   /* constants & indices */
   const int64_t D         = points.size(2);
   const int64_t batch_idx = blockIdx.x;
   const int64_t tid       = threadIdx.x;
-  constexpr int TOP_K = 20;     // choose randomly among the TOP_K farthest
 
   const int64_t L = start_length[batch_idx];                // number of seed points
   int64_t selected = (L > 0) ? start_idxs[batch_idx][L - 1] // last seed
                              : 0;                           // dummy when no seed
+
+  // Initialize shared memory for top-K selection
+  if (tid < TOP_K) {
+    top_dist_shared[tid] = -1.f;
+    top_idx_shared[tid] = -1;
+  }
 
   /* ── 1 · warm-up with user seeds ───────────────────────────────────────── */
   for (int64_t s_idx = 0; s_idx < L; ++s_idx) {
@@ -264,17 +276,31 @@ __global__ void FarthestPointSamplingGraphKernel(
     if (tid == 0)
       idxs[batch_idx][s_idx] = s; // copy seed order verbatim
 
-    /* update per-point minimum distance against this seed */
-    for (int64_t p = tid; p < lengths[batch_idx]; p += block_size) {
-      float dist2 = 0.f;
-      for (int64_t d = 0; d < D; ++d) {
-        float diff = points[batch_idx][s][d] - points[batch_idx][p][d];
-        dist2 += diff * diff;
+    /* update per-point minimum distance against this seed using shared memory caching */
+    for (int64_t p_start = 0; p_start < lengths[batch_idx]; p_start += SHARED_MEM_SIZE) {
+      const int64_t p_end = min(p_start + SHARED_MEM_SIZE, lengths[batch_idx]);
+      
+      // Load distances into shared memory for this chunk
+      for (int64_t p = p_start + tid; p < p_end; p += block_size) {
+        const int64_t shared_idx = p - p_start;
+        float dist2 = 0.f;
+        for (int64_t d = 0; d < D; ++d) {
+          float diff = points[batch_idx][s][d] - points[batch_idx][p][d];
+          dist2 += diff * diff;
+        }
+        shared_dist_cache[shared_idx] = min(dist2, min_point_dist[batch_idx][p]);
       }
-      const float p_min_dist = min(dist2, min_point_dist[batch_idx][p]);
-      min_point_dist[batch_idx][p] = p_min_dist;
+      
+      __syncthreads(); // Sync for shared memory access
+      
+      // Write back to global memory using atomic min operations where beneficial
+      for (int64_t p = p_start + tid; p < p_end; p += block_size) {
+        const int64_t shared_idx = p - p_start;
+        min_point_dist[batch_idx][p] = shared_dist_cache[shared_idx];
+      }
+      
+      __syncthreads(); // Ensure all writes complete before next chunk
     }
-    __syncthreads(); /* make sure all threads finished update before next seed */
   }
 
   /* ── 2 · FPS loop for the remaining K[n] selections ───────────────────── */
@@ -287,49 +313,82 @@ __global__ void FarthestPointSamplingGraphKernel(
     int64_t max_dist_idx = 0;
     float   max_dist     = -1.f;
 
-    /* scan all points */
-    for (int64_t p = tid; p < lengths[batch_idx]; p += block_size) {
-      float dist2 = 0.f;
-      for (int64_t d = 0; d < D; ++d) {
-        float diff = points[batch_idx][selected][d] - points[batch_idx][p][d];
-        dist2 += diff * diff;
-      }
-      const float p_min_dist = min(dist2, min_point_dist[batch_idx][p]);
-      min_point_dist[batch_idx][p] = p_min_dist;
+    /* scan all points with optimized memory access */
+    for (int64_t p_start = 0; p_start < lengths[batch_idx]; p_start += SHARED_MEM_SIZE) {
+      const int64_t p_end = min(p_start + SHARED_MEM_SIZE, lengths[batch_idx]);
+      
+      // Process chunk in shared memory
+      for (int64_t p = p_start + tid; p < p_end; p += block_size) {
+        float dist2 = 0.f;
+        for (int64_t d = 0; d < D; ++d) {
+          float diff = points[batch_idx][selected][d] - points[batch_idx][p][d];
+          dist2 += diff * diff;
+        }
+        const float p_min_dist = min(dist2, min_point_dist[batch_idx][p]);
+        min_point_dist[batch_idx][p] = p_min_dist;
 
-      max_dist_idx = (p_min_dist > max_dist) ? p : max_dist_idx;
-      max_dist     = (p_min_dist > max_dist) ? p_min_dist : max_dist;
+        // Update local maximum
+        max_dist_idx = (p_min_dist > max_dist) ? p : max_dist_idx;
+        max_dist     = (p_min_dist > max_dist) ? p_min_dist : max_dist;
+      }
     }
 
-    /* -------- stochastic override: random pick from top-5 --------------- */
-    if (tid == 0) {
-      float   top_dist[TOP_K];   int64_t top_idx[TOP_K];
-      #pragma unroll
-      for (int i = 0; i < TOP_K; ++i) { top_dist[i] = -1.f; top_idx[i] = -1; }
+    /* -------- optimized top-K selection using shared memory --------------- */
+    // Initialize shared arrays for collaborative top-K finding
+    if (tid < TOP_K) {
+      top_dist_shared[tid] = -1.f;
+      top_idx_shared[tid] = -1;
+    }
+    __syncthreads();
 
-      for (int64_t p = 0; p < lengths[batch_idx]; ++p) {
+    // Multi-pass approach to find top-K candidates
+    for (int pass = 0; pass < TOP_K; ++pass) {
+      float local_max_dist = -1.f;
+      int64_t local_max_idx = -1;
+      
+      // Each thread finds the best candidate not already selected
+      for (int64_t p = tid; p < lengths[batch_idx]; p += block_size) {
         float d = min_point_dist[batch_idx][p];
-        if (d > top_dist[TOP_K - 1]) {
-          int j = TOP_K - 1;
-          while (j > 0 && d > top_dist[j - 1]) {
-            top_dist[j] = top_dist[j - 1];
-            top_idx [j] = top_idx [j - 1];
-            --j;
+        
+        // Check if this point is already in the top-K list
+        bool already_selected = false;
+        for (int i = 0; i < pass; ++i) {
+          if (top_idx_shared[i] == p) {
+            already_selected = true;
+            break;
           }
-          top_dist[j] = d;
-          top_idx [j] = p;
+        }
+        
+        if (!already_selected && d > local_max_dist) {
+          local_max_dist = d;
+          local_max_idx = p;
         }
       }
+      
+      // Use block reduction to find the global maximum for this pass
+      auto local_candidate = cub::KeyValuePair<int64_t, float>(local_max_idx, local_max_dist);
+      auto best_candidate = BlockReduce(temp_storage).Reduce(local_candidate, cub::ArgMax(), block_size);
+      
+      // Thread 0 stores the result
+      if (tid == 0 && best_candidate.value > -1.f) {
+        top_dist_shared[pass] = best_candidate.value;
+        top_idx_shared[pass] = best_candidate.key;
+      }
+      
+      __syncthreads(); // Sync before next pass
+    }
 
+    // Thread 0 performs final random selection from top-K candidates
+    if (tid == 0) {
       int cand = 0;
-      for (int i = 0; i < TOP_K && top_idx[i] >= 0; ++i) ++cand;
+      for (int i = 0; i < TOP_K && top_idx_shared[i] >= 0; ++i) ++cand;
 
       unsigned long long r = clock64();
       int choice = (cand > 0) ? static_cast<int>(r % cand) : 0;
 
-      selected = top_idx[choice];
+      selected = top_idx_shared[choice];
       idxs[batch_idx][L + k] = selected;
-      selected_store         = selected;
+      selected_store = selected;
     }
 
     __syncthreads();
@@ -392,12 +451,22 @@ at::Tensor FarthestPointSamplingGraphCuda(
     return idxs;
   }
 
-  /* grid/block geometry */
+  /* optimized grid/block geometry with adaptive sizing */
   const size_t blocks = N;
   const int    MAX_THREADS_PER_BLOCK = 1024;
-  const int    points_pow_2 =
-      std::log(static_cast<double>(P)) / std::log(2.0);
-  const size_t threads = max(min(1 << points_pow_2, MAX_THREADS_PER_BLOCK), 2);
+  
+  // Dynamic thread count optimization based on problem characteristics
+  int points_pow_2 = std::log(static_cast<double>(P)) / std::log(2.0);
+  
+  // Adjust thread count based on point cloud density and memory constraints
+  size_t optimal_threads = max(min(1 << points_pow_2, MAX_THREADS_PER_BLOCK), 32);
+  
+  // For smaller point clouds, use fewer threads to improve occupancy
+  if (P < 256) {
+    optimal_threads = min(optimal_threads, static_cast<size_t>(128));
+  }
+  
+  const size_t threads = optimal_threads;
 
   /* build accessors */
   auto points_a  = points.packed_accessor64<float, 3, at::RestrictPtrTraits>();
@@ -411,7 +480,7 @@ at::Tensor FarthestPointSamplingGraphCuda(
   auto min_point_dist_a =
       min_point_dist.packed_accessor64<float, 2, at::RestrictPtrTraits>();
 
-  /* shared mem not needed – we use cub static storage */
+  /* shared mem for optimized version - CUB uses static allocation */
   const size_t shared_mem = 0;
 
 #define LAUNCH_FPS_KERNEL(BSIZE)                                                     \
