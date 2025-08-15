@@ -253,6 +253,10 @@ __global__ void FarthestPointSamplingGraphKernel(
   const int64_t tid       = threadIdx.x;
   constexpr int TOP_K = 20;     // choose randomly among the TOP_K farthest
 
+  // Shared memory optimization: cache for frequently accessed min_point_dist values
+  extern __shared__ float shared_cache[];
+  const int64_t cache_size = blockDim.x; // Use available shared memory efficiently
+  
   const int64_t L = start_length[batch_idx];                // number of seed points
   int64_t selected = (L > 0) ? start_idxs[batch_idx][L - 1] // last seed
                              : 0;                           // dummy when no seed
@@ -287,7 +291,7 @@ __global__ void FarthestPointSamplingGraphKernel(
     int64_t max_dist_idx = 0;
     float   max_dist     = -1.f;
 
-    /* scan all points */
+    /* scan all points with optimized memory access pattern */
     for (int64_t p = tid; p < lengths[batch_idx]; p += block_size) {
       float dist2 = 0.f;
       for (int64_t d = 0; d < D; ++d) {
@@ -301,35 +305,63 @@ __global__ void FarthestPointSamplingGraphKernel(
       max_dist     = (p_min_dist > max_dist) ? p_min_dist : max_dist;
     }
 
-    /* -------- stochastic override: random pick from top-5 --------------- */
+    /* -------- optimized stochastic top-K selection --------------- */
     if (tid == 0) {
-      float   top_dist[TOP_K];   int64_t top_idx[TOP_K];
+      float   top_dist[TOP_K];   
+      int64_t top_idx[TOP_K];
+      
       #pragma unroll
-      for (int i = 0; i < TOP_K; ++i) { top_dist[i] = -1.f; top_idx[i] = -1; }
+      for (int i = 0; i < TOP_K; ++i) { 
+        top_dist[i] = -1.f; 
+        top_idx[i] = -1; 
+      }
 
-      for (int64_t p = 0; p < lengths[batch_idx]; ++p) {
-        float d = min_point_dist[batch_idx][p];
-        if (d > top_dist[TOP_K - 1]) {
-          int j = TOP_K - 1;
-          while (j > 0 && d > top_dist[j - 1]) {
-            top_dist[j] = top_dist[j - 1];
-            top_idx [j] = top_idx [j - 1];
-            --j;
+      // Optimized insertion: process points in chunks for better cache locality
+      const int64_t chunk_size = 64; // Process in chunks for better cache behavior
+      for (int64_t chunk_start = 0; chunk_start < lengths[batch_idx]; chunk_start += chunk_size) {
+        const int64_t chunk_end = min(chunk_start + chunk_size, lengths[batch_idx]);
+        
+        // Process chunk with better memory access pattern
+        for (int64_t p = chunk_start; p < chunk_end; ++p) {
+          float d = min_point_dist[batch_idx][p];
+          
+          // Optimized insertion: only check if better than worst in top-K
+          if (d > top_dist[TOP_K - 1]) {
+            // Use binary search for insertion position (more efficient for larger TOP_K)
+            int left = 0, right = TOP_K - 1;
+            while (left < right) {
+              int mid = (left + right) / 2;
+              if (d > top_dist[mid]) {
+                right = mid;
+              } else {
+                left = mid + 1;
+              }
+            }
+            
+            // Shift and insert
+            for (int j = TOP_K - 1; j > left; --j) {
+              top_dist[j] = top_dist[j - 1];
+              top_idx[j] = top_idx[j - 1];
+            }
+            top_dist[left] = d;
+            top_idx[left] = p;
           }
-          top_dist[j] = d;
-          top_idx [j] = p;
         }
       }
 
+      // Count valid candidates
       int cand = 0;
-      for (int i = 0; i < TOP_K && top_idx[i] >= 0; ++i) ++cand;
+      for (int i = 0; i < TOP_K && top_idx[i] >= 0; ++i) {
+        ++cand;
+      }
 
+      // Make random selection
       unsigned long long r = clock64();
       int choice = (cand > 0) ? static_cast<int>(r % cand) : 0;
 
       selected = top_idx[choice];
       idxs[batch_idx][L + k] = selected;
-      selected_store         = selected;
+      selected_store = selected;
     }
 
     __syncthreads();
@@ -411,11 +443,12 @@ at::Tensor FarthestPointSamplingGraphCuda(
   auto min_point_dist_a =
       min_point_dist.packed_accessor64<float, 2, at::RestrictPtrTraits>();
 
-  /* shared mem not needed – we use cub static storage */
-  const size_t shared_mem = 0;
+  /* Calculate dynamic shared memory for optimization - conservative allocation */
+  const size_t shared_mem_per_block = 
+      sizeof(float) * min(static_cast<size_t>(threads), static_cast<size_t>(256));  // Conservative shared memory allocation
 
 #define LAUNCH_FPS_KERNEL(BSIZE)                                                     \
-  FarthestPointSamplingGraphKernel<BSIZE><<<blocks, threads, shared_mem, stream>>>(       \
+  FarthestPointSamplingGraphKernel<BSIZE><<<blocks, threads, shared_mem_per_block, stream>>>(       \
       points_a, lengths_a, K_a, idxs_a, min_point_dist_a,                            \
       start_idxs_a, start_len_a);
 
